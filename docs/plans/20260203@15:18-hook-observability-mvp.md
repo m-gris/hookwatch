@@ -177,12 +177,12 @@ hookwatch audit
 
 ---
 
-## Remaining Questions
+## Resolved Questions
 
-1. **Language choice:** OCaml (consistency with psst) or shell (simpler, faster prototype)?
-2. **Scope:** Separate tool (`hookwatch`) or module within psst (`psst watch`)?
-3. **Event types:** Which hook events matter? PreToolUse/PostToolUse? All of them?
-4. **Token estimation:** Simple char/4 heuristic? Or call a tokenizer?
+1. **Language:** Scala 3 + Scala Native + Typelevel Toolkit (FP, native binary, batteries included)
+2. **Scope:** Separate tool — different concerns, composable
+3. **Storage:** JSONL — simplest thing that works, no database
+4. **Token estimation:** Skip for MVP — add later if needed
 
 ---
 
@@ -213,6 +213,22 @@ hookwatch audit
 
 ## Implementation Plan (MVP: Observer Hook)
 
+### Stack
+
+**Scala 3 + Scala Native + Typelevel Toolkit**
+
+```scala
+//> using scala 3.3
+//> using platform native
+//> using toolkit typelevel:default
+```
+
+Why this stack:
+- **Typelevel Toolkit** — batteries included (cats-effect, fs2, circe, decline)
+- **Scala Native** — single binary, no JVM runtime
+- **scala-cli** — no sbt, just run/build
+- **JSONL** — simple append-only log, no database
+
 ### Architecture
 
 ```
@@ -223,50 +239,54 @@ hookwatch audit
 │    ┌───────────────────────────────┐    │
 │    │      FUNCTIONAL CORE          │    │
 │    │                               │    │
-│    │  Event → parse → store        │    │
+│    │  Event → parse → append JSONL │    │
 │    │  Events → aggregate → Report  │    │
 │    │                               │    │
 │    └───────────────────────────────┘    │
 │                                         │
-│  Hook script: reads stdin, logs, exit 0 │
+│  Hook: reads stdin, appends, exit 0     │
 └─────────────────────────────────────────┘
 ```
 
 ### Domain Types
 
-```ocaml
-type hook_event = {
-  session_id: string;
-  timestamp: string;
-  event_type: string;       (* PreToolUse, PostToolUse, etc. *)
-  tool_name: string option; (* for tool events *)
-  cwd: string;
-  raw_json: string;         (* preserve full input for debugging *)
-}
+```scala
+import io.circe.{Decoder, Encoder}
+import io.circe.generic.semiauto.*
 
-type session_summary = {
-  session_id: string;
-  start_time: string;
-  event_count: int;
-  by_event_type: (string * int) list;
-  by_tool: (string * int) list;
-}
+case class HookEvent(
+  sessionId: String,
+  timestamp: String,
+  eventType: String,        // PreToolUse, PostToolUse, etc.
+  toolName: Option[String], // for tool events
+  cwd: String,
+  rawJson: String           // preserve full input for debugging
+) derives Encoder.AsObject, Decoder
+
+case class SessionSummary(
+  sessionId: String,
+  startTime: String,
+  eventCount: Int,
+  byEventType: Map[String, Int],
+  byTool: Map[String, Int]
+)
 ```
 
 ### Files
 
 | File | Purpose |
 |------|---------|
-| `lib/event.ml` | Domain types + JSON parsing |
-| `lib/store.ml` | SQLite storage (append event, query) |
-| `lib/report.ml` | Pure aggregation functions |
-| `bin/cli.ml` | CLI: init, audit, tail |
-| `bin/hook.ml` | The observer hook script |
+| `src/domain.scala` | Domain types + circe codecs |
+| `src/store.scala` | JSONL append/read (fs2) |
+| `src/report.scala` | Pure aggregation functions |
+| `src/cli.scala` | CLI with decline |
+| `src/main.scala` | Entry point, wiring |
 
 ### CLI Commands
 
 ```bash
 hookwatch init      # Add observer hooks to settings.json
+hookwatch log       # (internal) append stdin to JSONL
 hookwatch audit     # Summary of current/recent session
 hookwatch tail      # Live stream of events
 hookwatch sessions  # List recent sessions
@@ -288,36 +308,33 @@ Each configured as: `{ "command": "hookwatch log", "type": "command" }`
 
 ### Storage
 
-SQLite at `~/.hookwatch/events.db`:
+JSONL at `~/.hookwatch/events.jsonl`:
 
-```sql
-CREATE TABLE events (
-  id INTEGER PRIMARY KEY,
-  session_id TEXT NOT NULL,
-  timestamp TEXT NOT NULL,
-  event_type TEXT NOT NULL,
-  tool_name TEXT,
-  cwd TEXT,
-  raw_json TEXT
-);
-
-CREATE INDEX idx_session ON events(session_id);
-CREATE INDEX idx_event_type ON events(event_type);
+```jsonl
+{"sessionId":"abc123","timestamp":"2024-01-01T12:00:00Z","eventType":"PreToolUse","toolName":"Bash","cwd":"/home/user","rawJson":"..."}
+{"sessionId":"abc123","timestamp":"2024-01-01T12:00:01Z","eventType":"PostToolUse","toolName":"Bash","cwd":"/home/user","rawJson":"..."}
 ```
 
-### Verification
+- Append-only (no corruption risk)
+- Human-readable (`cat`, `jq`, `grep`)
+- Easy to rotate/archive
+- fs2 streams for efficient reading
+
+### Build & Verify
 
 ```bash
-# Build
-opam exec -- dune build
+# Build native binary
+scala-cli --power package --native src/ -o hookwatch -f
 
-# Install hooks
+# Install to PATH
+cp hookwatch ~/.local/bin/
+
+# Configure hooks
 hookwatch init
 hookwatch doctor
 
 # Use Claude Code normally, then:
 hookwatch audit
-# Should show event counts for the session
 ```
 
 ---
@@ -326,11 +343,11 @@ hookwatch audit
 
 | ID | Title | Depends On |
 |----|-------|------------|
-| hw-001 | Domain types (Event, SessionSummary) | — |
-| hw-002 | SQLite store (append, query) | hw-001 |
-| hw-003 | Observer hook script | hw-001, hw-002 |
+| hw-001 | Domain types + circe codecs | — |
+| hw-002 | JSONL store (fs2 append/read) | hw-001 |
+| hw-003 | Observer hook (log command) | hw-001, hw-002 |
 | hw-004 | Report/aggregation functions | hw-001 |
-| hw-005 | CLI commands (init, audit, tail, doctor) | hw-002, hw-003, hw-004 |
+| hw-005 | CLI commands (decline) | hw-002, hw-003, hw-004 |
 | hw-006 | Homebrew formula | hw-005 |
 
 ---
@@ -338,7 +355,10 @@ hookwatch audit
 ## Decisions
 
 - **Name:** `hookwatch`
-- **Repo:** New repo (m-gris/hookwatch)
-- **Language:** OCaml (consistency with psst, FP principles)
+- **Repo:** m-gris/hookwatch
+- **Language:** Scala 3 + Scala Native
+- **Toolkit:** Typelevel (cats-effect, fs2, circe, decline)
+- **Build:** scala-cli (no sbt)
+- **Storage:** JSONL (no SQLite)
 - **Token estimation:** Skip for MVP, add later
 
